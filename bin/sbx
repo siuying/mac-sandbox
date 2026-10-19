@@ -1,0 +1,164 @@
+#!/bin/bash
+# Laptop-side CLI for mac-sandbox VMs.
+#
+#   sbx list                      VMs per host
+#   sbx shell VM                  SSH into a VM
+#   sbx push VM [BRANCH]          push the current repo/branch to VM:~/work/<repo>
+#   sbx fetch VM                  fetch the agents' branches back from the VM
+#   sbx secret NAME               store a secret in the login Keychain (CLAUDE_CODE_OAUTH_TOKEN, OPENAI_API_KEY, GH_TOKEN)
+#   sbx auth VM                   copy stored secrets (and ~/.codex/auth.json) into the VM
+#   sbx enroll VM                 authorize this laptop's SSH key in the VM
+#   sbx info VM                   image versions and Paseo daemon status
+#   sbx start|stop|reset VM       control the VM on its host (reset = fresh clone of the template)
+#   sbx add-host [USER@]HOST VM…  register a host's VMs in ~/.ssh (install.sh does this)
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+# shellcheck source=../config.env
+. "$ROOT/config.env"
+
+CONFIG_DIR="$HOME/.config/mac-sandbox"
+SSH_CONF_DIR="$HOME/.ssh/mac-sandbox"
+KEYCHAIN_SERVICE="mac-sandbox"
+SECRETS=(CLAUDE_CODE_OAUTH_TOKEN OPENAI_API_KEY GH_TOKEN)
+
+log() { printf '\033[1m==> %s\033[0m\n' "$*" >&2; }
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+host_of() {
+  local f
+  for f in "$CONFIG_DIR"/hosts/*; do
+    [[ -f "$f" ]] && grep -qx "$1" "$f" && { basename "$f"; return; }
+  done
+  die "unknown VM '$1'; run install.sh or sbx add-host"
+}
+
+# Run host/vm.sh on the VM's host. Paths are relative to the remote home directory.
+on_host() {
+  local vm=$1
+  shift
+  ssh "$(host_of "$vm")" "$HOST_DIR/host/vm.sh" "$@"
+}
+
+public_key() {
+  local k
+  for k in "$HOME"/.ssh/id_ed25519.pub "$HOME"/.ssh/id_ecdsa.pub "$HOME"/.ssh/id_rsa.pub; do
+    [[ -f "$k" ]] && { echo "$k"; return; }
+  done
+  die "no SSH public key in ~/.ssh"
+}
+
+repo_name() { basename "$(git rev-parse --show-toplevel)"; }
+
+cmd=${1:-help}
+shift || true
+case "$cmd" in
+  add-host)
+    target=${1:?usage: sbx add-host [USER@]HOST VM...}
+    shift
+    mkdir -p "$CONFIG_DIR/hosts" "$SSH_CONF_DIR"
+    chmod 700 "$SSH_CONF_DIR"
+    printf '%s\n' "$@" >"$CONFIG_DIR/hosts/$target"
+    # VMs are reached through an authenticated SSH connection to the host and Tart's
+    # host-only NAT, and every clone shares the template's host key, so known_hosts adds nothing.
+    for vm in "$@"; do
+      cat <<EOF
+Host $vm
+  User admin
+  ProxyCommand ssh $target $HOST_DIR/host/vm.sh nc $vm
+  UserKnownHostsFile /dev/null
+  StrictHostKeyChecking no
+  LogLevel ERROR
+  ServerAliveInterval 30
+
+EOF
+    done >"$SSH_CONF_DIR/$target.conf"
+    include="Include $SSH_CONF_DIR/*.conf"
+    if ! grep -qxF "$include" "$HOME/.ssh/config" 2>/dev/null; then
+      # Include must come before any Host block to apply everywhere.
+      { echo "$include"; echo; cat "$HOME/.ssh/config" 2>/dev/null || true; } >"$HOME/.ssh/config.tmp"
+      mv "$HOME/.ssh/config.tmp" "$HOME/.ssh/config"
+      chmod 600 "$HOME/.ssh/config"
+    fi
+    log "Added $* on $target"
+    ;;
+
+  list)
+    for f in "$CONFIG_DIR"/hosts/*; do
+      [[ -f "$f" ]] && echo "$(basename "$f"): $(tr '\n' ' ' <"$f")"
+    done
+    ;;
+
+  enroll)
+    vm=${1:?VM name}
+    host=$(host_of "$vm")
+    ssh "$host" "$HOST_DIR/host/vm.sh" wait "$vm"
+    ssh "$host" "$HOST_DIR/host/vm.sh exec -i $vm /bin/sh -c 'umask 077; mkdir -p ~/.ssh; cat >> ~/.ssh/authorized_keys; sort -u -o ~/.ssh/authorized_keys ~/.ssh/authorized_keys'" <"$(public_key)"
+    log "Authorized $(public_key) in $vm"
+    ;;
+
+  secret)
+    name=${1:?usage: sbx secret NAME   (e.g. CLAUDE_CODE_OAUTH_TOKEN from \`claude setup-token\`)}
+    security add-generic-password -U -s "$KEYCHAIN_SERVICE" -a "$name" -w
+    log "Stored $name in the login Keychain; run 'sbx auth VM' to copy it into a VM"
+    ;;
+
+  auth)
+    vm=${1:?VM name}
+    env_file=""
+    for name in "${SECRETS[@]}"; do
+      if value=$(security find-generic-password -s "$KEYCHAIN_SERVICE" -a "$name" -w 2>/dev/null); then
+        env_file+=$(printf 'export %s=%q' "$name" "$value")$'\n'
+      fi
+    done
+    [[ -n "$env_file" ]] || log "No secrets stored. Run 'claude setup-token', then 'sbx secret CLAUDE_CODE_OAUTH_TOKEN'"
+    printf '%s' "$env_file" | ssh "$vm" 'umask 077; mkdir -p ~/.config/mac-sandbox; cat > ~/.config/mac-sandbox/env'
+    if [[ -f "$HOME/.codex/auth.json" ]]; then
+      ssh "$vm" 'umask 077; mkdir -p ~/.codex; cat > ~/.codex/auth.json' <"$HOME/.codex/auth.json"
+    fi
+    ssh "$vm" 'launchctl kickstart -k gui/$(id -u)/com.mac-sandbox.paseo'
+    log "Credentials installed in $vm; Paseo daemon restarted"
+    ;;
+
+  shell)
+    vm=${1:?VM name}
+    shift
+    exec ssh -t "$vm" "$@"
+    ;;
+
+  push)
+    vm=${1:?VM name}
+    branch=${2:-$(git branch --show-current)}
+    name=$(repo_name)
+    ssh "$vm" "mkdir -p ~/work && git init -q ~/work/$name"
+    git remote get-url "$vm" >/dev/null 2>&1 || git remote add "$vm" "$vm:work/$name"
+    git push "$vm" "$branch"
+    log "Pushed $branch to $vm:~/work/$name. In Paseo, open that path on host ssh://$vm"
+    ;;
+
+  fetch)
+    vm=${1:?VM name}
+    git fetch "$vm"
+    git branch -r --list "$vm/*"
+    ;;
+
+  info)
+    vm=${1:?VM name}
+    ssh "$vm" 'cat ~/.mac-sandbox/image-info.txt; echo; paseo daemon status'
+    ;;
+
+  start | stop)
+    on_host "${1:?VM name}" "$cmd" "$1"
+    ;;
+
+  reset)
+    vm=${1:?VM name}
+    on_host "$vm" reset "$vm"
+    "$0" enroll "$vm"
+    "$0" auth "$vm"
+    ;;
+
+  *)
+    sed -n '2,15p' "$0"
+    ;;
+esac

@@ -1,0 +1,24 @@
+# Per-host overrides written by install.sh
+config.local.env
+*.local.env
+
+# Generated VM artifacts (tart export, disk images, NVRAM) and logs
+*.tvm
+*.img
+*.raw
+*.ipsw
+nvram.bin
+*.log
+
+# Credentials and private data
+env
+*.env.secret
+auth.json
+.claude.json
+*.pem
+*.key
+id_*
+!id_*.pub
+known_hosts*
+
+.DS_Store

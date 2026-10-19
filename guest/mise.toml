@@ -1,0 +1,15 @@
+# Tools in every sandbox VM. Installed as the VM's global mise config (~/.config/mise/config.toml)
+# when the template is built. Any tool from https://mise.jdx.dev/registry.html works, including
+# npm:, pipx:, cargo:, aqua: and github: backends. Rebuild the template after editing.
+
+[tools]
+ruby = "latest"
+node = "lts"
+gh = "latest"
+codex = "latest"
+claude = "latest"
+"npm:@getpaseo/cli" = "latest"
+
+[settings]
+# Repos pushed into the VM live in ~/work; let their mise.toml files load without a trust prompt.
+trusted_config_paths = ["/Users/admin/work"]
